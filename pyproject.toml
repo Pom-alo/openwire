@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openwire"
+version = "0.1.0"
+description = "A small peer-to-peer file sharing system, written from scratch to learn how P2P networks work."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "pom-alo"}]
+keywords = ["p2p", "peer-to-peer", "file-sharing", "networking", "asyncio", "napster", "gnutella"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Education",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Communications :: File Sharing",
+  "Topic :: Education",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/Pom-alo/openwire"
+
+[project.scripts]
+openwire = "openwire.cli:main"
+
+[tool.setuptools]
+packages = ["openwire"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
