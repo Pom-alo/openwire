@@ -35,6 +35,13 @@ PROTOCOL_VERSION = 1
 #: announce a 4 GiB frame and make us allocate memory for it.
 MAX_FRAME = 1024 * 1024
 
+#: Longest file name that may be registered. Peers truncate longer names
+#: before sending; the tracker rejects anything longer.
+MAX_NAME_LENGTH = 512
+
+#: Largest file size either side accepts: the biggest integer JSON carries exactly.
+MAX_FILE_SIZE = 1 << 53
+
 _HEADER = struct.Struct(">I")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -65,7 +72,7 @@ def decode_body(body: bytes) -> Message:
     """Parse a frame body, insisting on a JSON object with a string 'type'."""
     try:
         message = json.loads(body)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:  # thousands of nested brackets blow the parser's stack
         raise ProtocolError("frame body is not valid JSON") from exc
     if not isinstance(message, dict) or not isinstance(message.get("type"), str):
         raise ProtocolError("message must be a JSON object with a string 'type'")
@@ -115,9 +122,18 @@ def describe(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
-async def close_writer(writer: asyncio.StreamWriter) -> None:
-    """Close a StreamWriter without letting shutdown-time errors escape."""
-    writer.close()
+async def close_writer(writer: asyncio.StreamWriter, *, abort: bool = False) -> None:
+    """Close a StreamWriter without letting shutdown-time errors escape.
+
+    A graceful close waits for anything still queued to be sent first. When
+    the other side has stopped reading, that is a wait that never ends, so
+    callers that are giving up on a connection pass ``abort=True`` to drop it
+    at once and discard the queue.
+    """
+    if abort:
+        writer.transport.abort()
+    else:
+        writer.close()
     try:
         await writer.wait_closed()
     except OSError:

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,13 @@ version = "0.1.0"
 description = "A small peer-to-peer file sharing system, written from scratch to learn how P2P networks work."
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "pom-alo"}]
 keywords = ["p2p", "peer-to-peer", "file-sharing", "networking", "asyncio", "napster", "gnutella"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Education",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Topic :: Communications :: File Sharing",

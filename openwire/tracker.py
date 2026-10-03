@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 
 from . import protocol
 from .protocol import (
+    MAX_FILE_SIZE,
+    MAX_NAME_LENGTH,
     PROTOCOL_VERSION,
     ConnectionClosed,
     Message,
@@ -43,11 +45,37 @@ log = logging.getLogger("openwire.tracker")
 DEFAULT_PORT = 8888  # Napster's servers listened on 8888 (and 7777, 4444, ...)
 
 MAX_FILES_PER_PEER = 50_000
-MAX_NAME_LENGTH = 512
 MAX_NICK_LENGTH = 32
 MAX_QUERY_LENGTH = 200
 MAX_RESULTS = 50
-MAX_FILE_SIZE = 1 << 53  # the largest integer JSON carries exactly
+
+# Memory is the tracker's only resource, and these two numbers bound it:
+# roughly 100 bytes per indexed file, and a few KiB per connection.
+DEFAULT_MAX_CONNECTIONS = 1_000
+DEFAULT_MAX_TOTAL_FILES = 1_000_000
+
+# Replies must fit in one frame no matter how popular a file is. Fifty results
+# with twenty sources each is about 100 KiB; a thousand sources each would not fit.
+MAX_SOURCES_PER_RESULT = 20
+MAX_LOOKUP_SOURCES = 100
+
+__all__ = [
+    "DEFAULT_MAX_CONNECTIONS",
+    "DEFAULT_MAX_TOTAL_FILES",
+    "DEFAULT_PORT",
+    "MAX_FILES_PER_PEER",
+    "MAX_FILE_SIZE",
+    "MAX_LOOKUP_SOURCES",
+    "MAX_NAME_LENGTH",
+    "MAX_NICK_LENGTH",
+    "MAX_QUERY_LENGTH",
+    "MAX_RESULTS",
+    "MAX_SOURCES_PER_RESULT",
+    "BadRequest",
+    "FileMeta",
+    "PeerRecord",
+    "Tracker",
+]
 
 
 class BadRequest(Exception):
@@ -78,10 +106,24 @@ class PeerRecord:
 
 
 class Tracker:
-    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT, *, idle_timeout: float = 90.0) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = DEFAULT_PORT,
+        *,
+        idle_timeout: float = 90.0,
+        hello_timeout: float = 10.0,
+        write_timeout: float = 30.0,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        max_total_files: int = DEFAULT_MAX_TOTAL_FILES,
+    ) -> None:
         self.host = host
         self.port = port
         self.idle_timeout = idle_timeout
+        self.hello_timeout = hello_timeout  # a connection that never introduces itself is cheap to drop
+        self.write_timeout = write_timeout  # a peer that stops reading our replies is dropped too
+        self.max_connections = max_connections
+        self.max_total_files = max_total_files
         self.peers: dict[str, PeerRecord] = {}
         self._server: asyncio.base_events.Server | None = None
         self._connections: set[asyncio.StreamWriter] = set()
@@ -89,22 +131,27 @@ class Tracker:
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_connection, self.host, self.port)
         self.port = self._server.sockets[0].getsockname()[1]
-        log.info("tracker listening on %s:%d", self.host, self.port)
+        log.debug("tracker listening on %s:%d", self.host, self.port)
 
     async def serve_forever(self) -> None:
         assert self._server is not None, "call start() first"
         await self._server.serve_forever()
 
     async def close(self) -> None:
+        # Drop the live peers first. Aborting our end makes each handler's
+        # pending read fail, which runs its cleanup and withdraws the peer's
+        # files. (On Python 3.12+ wait_closed() waits for those handlers, so
+        # this order also keeps close() from stalling for the idle timeout.)
+        for writer in list(self._connections):
+            writer.transport.abort()
+        self._connections.clear()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        # Drop the live peers too. Closing our end makes each handler's pending
-        # read fail, which runs its cleanup and withdraws the peer's files.
-        for writer in list(self._connections):
-            writer.close()
-        self._connections.clear()
+
+    async def _send(self, writer: asyncio.StreamWriter, message: Message) -> None:
+        await asyncio.wait_for(write_message(writer, message), self.write_timeout)
 
     @property
     def file_count(self) -> int:
@@ -117,22 +164,30 @@ class Tracker:
         peername = writer.get_extra_info("peername")
         observed_host = peername[0] if peername else "unknown"
         record: PeerRecord | None = None
+        if len(self._connections) >= self.max_connections:
+            log.warning("turning away %s: %d connections is the limit", observed_host, self.max_connections)
+            try:
+                await self._send(writer, protocol.error("full", "this tracker has as many peers as it can take"))
+            except (OSError, TimeoutError):
+                pass
+            await close_writer(writer)
+            return
         self._connections.add(writer)
+        abort = False
         try:
             while True:
-                message = await read_message(reader, timeout=self.idle_timeout)
+                timeout = self.idle_timeout if record is not None else self.hello_timeout
+                message = await read_message(reader, timeout=timeout)
                 kind = message["type"]
                 if kind == "bye":
                     break
                 if record is None:
                     # The first message must introduce the peer.
                     if kind != "hello":
-                        await write_message(
-                            writer, protocol.error("hello_required", "say hello before anything else")
-                        )
+                        await self._send(writer, protocol.error("hello_required", "say hello before anything else"))
                         break
                     record = self._hello(message, observed_host)
-                    await write_message(
+                    await self._send(
                         writer,
                         {
                             "type": "welcome",
@@ -146,19 +201,22 @@ class Tracker:
                     reply = self._dispatch(record, message)
                 except BadRequest as exc:
                     reply = protocol.error("bad_request", exc.message)
-                await write_message(writer, reply)
-        except BadRequest as exc:  # a malformed hello
+                await self._send(writer, reply)
+        except BadRequest as exc:  # a malformed hello: answer, then hang up
             try:
-                await write_message(writer, protocol.error("bad_request", exc.message))
-            except OSError:
+                await self._send(writer, protocol.error("bad_request", exc.message))
+            except (OSError, TimeoutError):
                 pass
         except ConnectionClosed:
             pass
         except TimeoutError:
-            log.info("%s idle for %.0fs, dropping", _who(record, observed_host), self.idle_timeout)
+            abort = True  # the peer may have stopped reading; do not wait on our unsent replies
+            log.info("%s went quiet, dropping", _who(record, observed_host))
         except ProtocolError as exc:
+            abort = True
             log.warning("%s broke protocol: %s", _who(record, observed_host), exc)
         except OSError as exc:
+            abort = True
             log.debug("%s connection error: %s", _who(record, observed_host), protocol.describe(exc))
         finally:
             self._connections.discard(writer)
@@ -168,20 +226,25 @@ class Tracker:
                 log.info(
                     "peer %s (%s) left; %d files withdrawn", record.peer_id, record.nick, len(record.files)
                 )
-            await close_writer(writer)
+            await close_writer(writer, abort=abort)
 
     # ---------------------------------------------------------- messages --
 
     def _hello(self, message: Message, observed_host: str) -> PeerRecord:
         port = _require_int(message, "port", 1, 65535)
-        nick = message.get("nick") or ""
+        nick = message.get("nick")
+        if nick is None:
+            nick = ""
         if not isinstance(nick, str) or len(nick) > MAX_NICK_LENGTH or not nick.isprintable():
             raise BadRequest(f"nick must be printable text of at most {MAX_NICK_LENGTH} characters")
+        nick = nick.strip()
         # Like Napster, we normally record the address the connection came from:
         # the peer may not know its own reachable address, but we can see it.
-        host = message.get("host", observed_host)
-        if not isinstance(host, str) or not host or len(host) > 253:
-            raise BadRequest("host must be a non-empty string")
+        host = message.get("host")
+        if host is None:
+            host = observed_host
+        if not isinstance(host, str) or not host or len(host) > 253 or not host.isprintable():
+            raise BadRequest("host must be a non-empty printable string")
         peer_id = secrets.token_hex(6)
         record = PeerRecord(peer_id=peer_id, nick=nick or peer_id, host=host, port=port)
         self.peers[peer_id] = record
@@ -203,13 +266,18 @@ class Tracker:
         return protocol.error("unknown_type", f"unknown message type {kind!r}")
 
     def _register(self, record: PeerRecord, message: Message) -> Message:
-        """Replace the peer's whole file list with the one in the message."""
+        """Replace the peer's file list, or extend it when ``append`` is true.
+
+        A big share folder does not fit in one frame, so peers send it in
+        pages: the first replaces, the rest append.
+        """
         files = message.get("files")
         if not isinstance(files, list):
             raise BadRequest("files must be a list")
-        if len(files) > MAX_FILES_PER_PEER:
-            raise BadRequest(f"at most {MAX_FILES_PER_PEER} files per peer")
-        parsed: dict[str, FileMeta] = {}
+        append = message.get("append", False)
+        if not isinstance(append, bool):
+            raise BadRequest("append must be true or false")
+        parsed: dict[str, FileMeta] = dict(record.files) if append else {}
         for entry in files:
             if not isinstance(entry, dict):
                 raise BadRequest("each file must be an object")
@@ -221,8 +289,12 @@ class Tracker:
                 raise BadRequest(f"each file needs a name of 1 to {MAX_NAME_LENGTH} characters")
             size = _require_int(entry, "size", 0, MAX_FILE_SIZE)
             parsed[digest] = FileMeta(name=name, size=size)
+        if len(parsed) > MAX_FILES_PER_PEER:
+            raise BadRequest(f"at most {MAX_FILES_PER_PEER} files per peer")
+        if self.file_count - len(record.files) + len(parsed) > self.max_total_files:
+            raise BadRequest("the tracker's index is full; try again later or share fewer files")
         record.files = parsed
-        log.info("peer %s (%s) registered %d files", record.peer_id, record.nick, len(parsed))
+        log.info("peer %s (%s) now shares %d files", record.peer_id, record.nick, len(parsed))
         return {"type": "ok", "count": len(parsed)}
 
     def _search(self, record: PeerRecord, message: Message) -> Message:
@@ -251,7 +323,11 @@ class Tracker:
                         hit = hits[digest] = {"sha256": digest, "name": meta.name, "size": meta.size, "sources": []}
                     hit["sources"].append(peer.as_source())
         ordered = sorted(hits.values(), key=lambda h: (-len(h["sources"]), h["name"].lower()))
-        return {"type": "results", "query": query, "total": len(ordered), "results": ordered[:MAX_RESULTS]}
+        results = ordered[:MAX_RESULTS]
+        for hit in results:
+            hit["total_sources"] = len(hit["sources"])
+            del hit["sources"][MAX_SOURCES_PER_RESULT:]
+        return {"type": "results", "query": query, "total": len(ordered), "results": results}
 
     def _lookup(self, record: PeerRecord, message: Message) -> Message:
         """Who has this exact file right now? Used for retries and for downloading by hash."""
@@ -270,7 +346,14 @@ class Tracker:
             if name is None:
                 name, size = meta.name, meta.size
             sources.append(peer.as_source())
-        return {"type": "sources", "sha256": digest, "name": name, "size": size, "sources": sources}
+        return {
+            "type": "sources",
+            "sha256": digest,
+            "name": name,
+            "size": size,
+            "total": len(sources),
+            "sources": sources[:MAX_LOOKUP_SOURCES],
+        }
 
 
 def _require_int(obj: Message, key: str, low: int, high: int) -> int:

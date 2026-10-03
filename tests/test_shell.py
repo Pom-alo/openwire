@@ -35,7 +35,7 @@ def test_shell_search_get_and_friends(tmp_path):
 
             out = io.StringIO()
             script = Script(
-                "", "help", "ls", "search", "search nothing-here", "search summer", "get 9", "get 1",
+                "", "help", "ls", "search", "search nothing-here", "search summer", "get 9", "get banana", "get 1",
                 "get " + "0" * 64, "status", "rescan", "dance", "quit", "never reached",
             )
             await Shell(bob, out=out).run(script)
@@ -51,6 +51,7 @@ def test_shell_search_get_and_friends(tmp_path):
     assert "usage: search" in text
     assert "no matches" in text
     assert "summer 99.mp3" in text and "get <#> to download" in text
+    assert "pick 1 to 1" in text
     assert "usage: get" in text
     assert "saved to" in text
     assert (tmp_path / "bob/dl/summer 99.mp3").read_bytes() == data

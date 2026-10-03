@@ -11,8 +11,10 @@ that multi-source downloads (Phase 2) are built on.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,17 +68,15 @@ class SharedFile:
         return {"name": self.name, "size": self.size, "sha256": self.sha256}
 
 
-def scan_directory(root: Path) -> dict[str, SharedFile]:
-    """Hash every regular file under ``root``; return them keyed by SHA-256.
+def iter_shareable(root: Path) -> Iterator[Path]:
+    """Yield the regular files under ``root`` that a peer shares.
 
-    Hidden files and folders (dot-prefixed) and symlinks are skipped. If two
-    files have identical content only the first is kept: the index is a set
-    of *contents*, and one copy is all a peer needs to serve.
+    Hidden files and folders (dot-prefixed) and symlinks are skipped, in a
+    stable order: a folder's own files first, then its subfolders.
     """
-    index: dict[str, SharedFile] = {}
     root = Path(root).resolve()
     if not root.is_dir():
-        return index
+        return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         for filename in sorted(filenames):
@@ -85,13 +85,37 @@ def scan_directory(root: Path) -> dict[str, SharedFile]:
             path = Path(dirpath) / filename
             if path.is_symlink() or not path.is_file():
                 continue
-            try:
-                digest, size = hash_file(path)
-            except OSError:
-                continue
-            if digest in index:
-                continue
-            index[digest] = SharedFile(
-                path=path, name=path.relative_to(root).as_posix(), size=size, sha256=digest
-            )
+            yield path
+
+
+def _index_one(index: dict[str, SharedFile], root: Path, path: Path) -> None:
+    try:
+        digest, size = hash_file(path)
+    except OSError:
+        return
+    if digest in index:
+        return  # identical content already indexed: one copy is all a peer needs to serve
+    index[digest] = SharedFile(path=path, name=path.relative_to(root).as_posix(), size=size, sha256=digest)
+
+
+def scan_directory(root: Path) -> dict[str, SharedFile]:
+    """Hash every shareable file under ``root``; return them keyed by SHA-256."""
+    root = Path(root).resolve()
+    index: dict[str, SharedFile] = {}
+    for path in iter_shareable(root):
+        _index_one(index, root, path)
+    return index
+
+
+async def scan_directory_async(root: Path) -> dict[str, SharedFile]:
+    """Like :func:`scan_directory`, but hashes one file per worker-thread hop.
+
+    Hashing is CPU and disk bound and must stay off the event loop. Doing it
+    file by file, rather than in one long thread call, keeps the loop (and
+    Ctrl-C) responsive between files.
+    """
+    root = Path(root).resolve()
+    index: dict[str, SharedFile] = {}
+    for path in await asyncio.to_thread(lambda: list(iter_shareable(root))):
+        await asyncio.to_thread(_index_one, index, root, path)
     return index

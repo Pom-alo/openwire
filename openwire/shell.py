@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import threading
 import time
@@ -10,8 +11,10 @@ from typing import TextIO
 
 from . import __version__
 from .peer import Peer, Result, TrackerError
-from .protocol import normalize_sha256
+from .protocol import describe, normalize_sha256
 from .transfer import TransferError
+
+log = logging.getLogger("openwire.shell")
 
 HELP = """\
 Commands:
@@ -32,6 +35,16 @@ def fmt_size(n: int) -> str:
             return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     raise AssertionError("unreachable")
+
+
+def safe_text(text: str) -> str:
+    """Make a string that came from the network safe to print.
+
+    Control characters and other non-printing code points (terminal escape
+    sequences, bidi overrides, line breaks) become ``?`` so a file name
+    cannot repaint or fake the terminal.
+    """
+    return "".join(ch if ch.isprintable() else "?" for ch in text)
 
 
 class StdinLines:
@@ -82,17 +95,21 @@ class Shell:
             if line is None:
                 self.say()
                 return
-            line = line.strip()
-            if not line:
+            parts = line.split(None, 1)  # any whitespace separates command and argument
+            if not parts:
                 continue
-            command, _, arg = line.partition(" ")
+            command = parts[0]
+            arg = parts[1].strip() if len(parts) > 1 else ""
             try:
-                if not await self.dispatch(command.lower(), arg.strip()):
+                if not await self.dispatch(command.lower(), arg):
                     return
             except TrackerError as exc:
                 self.say(f"tracker: {exc}")
             except TransferError as exc:
                 self.say(f"download failed: {exc}")
+            except Exception as exc:  # a bug or a surprise from the OS must not end the session
+                log.debug("command %r failed", command, exc_info=True)
+                self.say(f"error: {describe(exc)}")
 
     async def dispatch(self, command: str, arg: str) -> bool:
         """Run one command; return False when the user wants to leave."""
@@ -112,7 +129,7 @@ class Shell:
             count = await self.peer.rescan()
             self.say(f"sharing {count} files")
         else:
-            self.say(f"unknown command {command!r}; try 'help'")
+            self.say(f"unknown command {safe_text(command)!r}; try 'help'")
         return True
 
     # ------------------------------------------------------------ commands --
@@ -122,7 +139,9 @@ class Shell:
         self.say(f"openwire {__version__}  -  peer {peer.peer_id} ({peer.nick or 'no nick'})")
         self.say(f"  sharing    {len(peer.index)} files from {peer.share_dir}")
         self.say(f"  listening  {peer.host}:{peer.port}   downloads -> {peer.download_dir}")
-        self.say(f"  tracker    {peer.tracker_addr[0]}:{peer.tracker_addr[1]}  (sees you as {peer.observed_host})")
+        self.say(
+            f"  tracker    {peer.tracker_addr[0]}:{peer.tracker_addr[1]}  (sees you as {safe_text(str(peer.observed_host))})"
+        )
         self.say("Type 'help' for commands.")
 
     async def cmd_search(self, query: str) -> None:
@@ -135,23 +154,28 @@ class Shell:
             return
         self.say(f"  {'#':>3}  {'size':>10}  {'srcs':>4}  name")
         for number, result in enumerate(self.results, start=1):
-            self.say(f"  {number:>3}  {fmt_size(result.size):>10}  {len(result.sources):>4}  {result.name}")
+            self.say(f"  {number:>3}  {fmt_size(result.size):>10}  {result.total_sources:>4}  {safe_text(result.name)}")
         self.say("get <#> to download")
 
     async def cmd_get(self, arg: str) -> None:
-        if arg.isdigit() and 1 <= int(arg) <= len(self.results):
-            result = self.results[int(arg) - 1]
-        elif normalize_sha256(arg):
+        if normalize_sha256(arg):  # checked first: a hash of all digits is still a hash
             found = await self.peer.lookup(arg)
             if found is None:
                 self.say("nobody is sharing that file right now")
                 return
             result = found
+        elif arg.isdigit() and 1 <= int(arg) <= len(self.results):
+            result = self.results[int(arg) - 1]
+        elif arg.isdigit():
+            self.say(f"no result number {arg}; run a search first" if not self.results else f"pick 1 to {len(self.results)}")
+            return
         else:
             self.say("usage: get <result number from the last search>  or  get <sha256>")
             return
 
-        self.say(f"downloading {result.name} ({fmt_size(result.size)}) from {len(result.sources)} source(s)")
+        self.say(
+            f"downloading {safe_text(result.name)} ({fmt_size(result.size)}) from {len(result.sources)} source(s)"
+        )
         last_print = 0.0
 
         def progress(done: int, total: int) -> None:
@@ -166,14 +190,14 @@ class Shell:
             saved = await self.peer.download(result, progress=progress)
         finally:
             self.say()
-        self.say(f"saved to {saved}")
+        self.say(f"saved to {safe_text(str(saved))}")
 
     def cmd_ls(self) -> None:
         if not self.peer.index:
             self.say(f"sharing nothing; put files in {self.peer.share_dir} and run 'rescan'")
             return
         for shared in sorted(self.peer.index.values(), key=lambda f: f.name.lower()):
-            self.say(f"  {fmt_size(shared.size):>10}  {shared.sha256[:12]}  {shared.name}")
+            self.say(f"  {fmt_size(shared.size):>10}  {shared.sha256[:12]}  {safe_text(shared.name)}")
         self.say(f"{len(self.peer.index)} files")
 
     def cmd_status(self) -> None:
@@ -182,6 +206,6 @@ class Shell:
         self.say(f"  peer id    {peer.peer_id}  nick {peer.nick or '-'}")
         self.say(f"  listening  {peer.host}:{peer.port}")
         self.say(f"  tracker    {peer.tracker_addr[0]}:{peer.tracker_addr[1]}  {state}")
-        self.say(f"  seen as    {peer.observed_host}:{peer.port}")
+        self.say(f"  seen as    {safe_text(str(peer.observed_host))}:{peer.port}")
         self.say(f"  sharing    {len(peer.index)} files from {peer.share_dir}")
         self.say(f"  downloads  {peer.download_dir}")

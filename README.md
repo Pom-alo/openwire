@@ -88,7 +88,8 @@ Run the tracker with `--host 0.0.0.0`, and each peer with `--host 0.0.0.0 --trac
 | `ls` | list what you are sharing |
 | `status` | your peer id, address, tracker connection |
 | `rescan` | re-hash the share folder and re-register |
-| `quit` | leave; your files vanish from the index immediately |
+| `help` | list the commands |
+| `quit` (or `exit`, `q`) | leave; your files vanish from the index immediately |
 
 Downloads resume: a partial file is kept in `downloads/.partial/` and the next `get` asks only for the rest.
 
